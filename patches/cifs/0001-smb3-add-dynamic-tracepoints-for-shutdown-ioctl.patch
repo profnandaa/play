@@ -1,0 +1,169 @@
+From 50d752ccca1b3564fa9ac287d2e974c14d0c369c Mon Sep 17 00:00:00 2001
+From: Steve French <stfrench@microsoft.com>
+Date: Tue, 30 Jul 2024 00:26:21 -0500
+Subject: [PATCH] smb3: add dynamic tracepoints for shutdown ioctl
+
+For debugging an umount failure in xfstests generic/043 generic/044 in some
+configurations, we needed more information on the shutdown ioctl which
+was suspected of being related to the cause, so tracepoints are added
+in this patch e.g.
+
+  "trace-cmd record -e smb3_shutdown_enter -e smb3_shutdown_done -e smb3_shutdown_err"
+
+Sample output:
+  godown-47084   [011] .....  3313.756965: smb3_shutdown_enter: flags=0x1 tid=0x733b3e75
+  godown-47084   [011] .....  3313.756968: smb3_shutdown_done: flags=0x1 tid=0x733b3e75
+
+Signed-off-by: Steve French <stfrench@microsoft.com>
+---
+ fs/smb/client/ioctl.c | 32 +++++++++++++++++++++------
+ fs/smb/client/trace.h | 51 ++++++++++++++++++++++++++++++++++++++++++-
+ 2 files changed, 75 insertions(+), 8 deletions(-)
+
+diff --git a/fs/smb/client/ioctl.c b/fs/smb/client/ioctl.c
+index 855ac5a62edf..44dbaf9929a4 100644
+--- a/fs/smb/client/ioctl.c
++++ b/fs/smb/client/ioctl.c
+@@ -170,7 +170,10 @@ static long smb_mnt_get_fsinfo(unsigned int xid, struct cifs_tcon *tcon,
+ static int cifs_shutdown(struct super_block *sb, unsigned long arg)
+ {
+ 	struct cifs_sb_info *sbi = CIFS_SB(sb);
++	struct tcon_link *tlink;
++	struct cifs_tcon *tcon;
+ 	__u32 flags;
++	int rc;
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+@@ -178,14 +181,21 @@ static int cifs_shutdown(struct super_block *sb, unsigned long arg)
+ 	if (get_user(flags, (__u32 __user *)arg))
+ 		return -EFAULT;
+ 
+-	if (flags > CIFS_GOING_FLAGS_NOLOGFLUSH)
+-		return -EINVAL;
++	tlink = cifs_sb_tlink(sbi);
++	if (IS_ERR(tlink))
++		return PTR_ERR(tlink);
++	tcon = tlink_tcon(tlink);
++
++	trace_smb3_shutdown_enter(flags, tcon->tid);
++	if (flags > CIFS_GOING_FLAGS_NOLOGFLUSH) {
++		rc = -EINVAL;
++		goto shutdown_out_err;
++	}
+ 
+ 	if (cifs_forced_shutdown(sbi))
+-		return 0;
++		goto shutdown_good;
+ 
+ 	cifs_dbg(VFS, "shut down requested (%d)", flags);
+-/*	trace_cifs_shutdown(sb, flags);*/
+ 
+ 	/*
+ 	 * see:
+@@ -201,7 +211,8 @@ static int cifs_shutdown(struct super_block *sb, unsigned long arg)
+ 	 */
+ 	case CIFS_GOING_FLAGS_DEFAULT:
+ 		cifs_dbg(FYI, "shutdown with default flag not supported\n");
+-		return -EINVAL;
++		rc = -EINVAL;
++		goto shutdown_out_err;
+ 	/*
+ 	 * FLAGS_LOGFLUSH is easy since it asks to write out metadata (not
+ 	 * data) but metadata writes are not cached on the client, so can treat
+@@ -210,11 +221,18 @@ static int cifs_shutdown(struct super_block *sb, unsigned long arg)
+ 	case CIFS_GOING_FLAGS_LOGFLUSH:
+ 	case CIFS_GOING_FLAGS_NOLOGFLUSH:
+ 		sbi->mnt_cifs_flags |= CIFS_MOUNT_SHUTDOWN;
+-		return 0;
++		goto shutdown_good;
+ 	default:
+-		return -EINVAL;
++		rc = -EINVAL;
++		goto shutdown_out_err;
+ 	}
++
++shutdown_good:
++	trace_smb3_shutdown_done(flags, tcon->tid);
+ 	return 0;
++shutdown_out_err:
++	trace_smb3_shutdown_err(rc, flags, tcon->tid);
++	return rc;
+ }
+ 
+ static int cifs_dump_full_key(struct cifs_tcon *tcon, struct smb3_full_key_debug_info __user *in)
+diff --git a/fs/smb/client/trace.h b/fs/smb/client/trace.h
+index 6b3bdfb97211..0f0c10c7ada7 100644
+--- a/fs/smb/client/trace.h
++++ b/fs/smb/client/trace.h
+@@ -1388,7 +1388,7 @@ DECLARE_EVENT_CLASS(smb3_ioctl_class,
+ 		__entry->command = command;
+ 	),
+ 	TP_printk("xid=%u fid=0x%llx ioctl cmd=0x%x",
+-		__entry->xid, __entry->fid, __entry->command)
++		  __entry->xid, __entry->fid, __entry->command)
+ )
+ 
+ #define DEFINE_SMB3_IOCTL_EVENT(name)        \
+@@ -1400,9 +1400,58 @@ DEFINE_EVENT(smb3_ioctl_class, smb3_##name,  \
+ 
+ DEFINE_SMB3_IOCTL_EVENT(ioctl);
+ 
++DECLARE_EVENT_CLASS(smb3_shutdown_class,
++	TP_PROTO(__u32 flags,
++		__u32 tid),
++	TP_ARGS(flags, tid),
++	TP_STRUCT__entry(
++		__field(__u32, flags)
++		__field(__u32, tid)
++	),
++	TP_fast_assign(
++		__entry->flags = flags;
++		__entry->tid = tid;
++	),
++	TP_printk("flags=0x%x tid=0x%x",
++		  __entry->flags, __entry->tid)
++)
++
++#define DEFINE_SMB3_SHUTDOWN_EVENT(name)        \
++DEFINE_EVENT(smb3_shutdown_class, smb3_##name,  \
++	TP_PROTO(__u32 flags,		     \
++		__u32 tid),		     \
++	TP_ARGS(flags, tid))
++
++DEFINE_SMB3_SHUTDOWN_EVENT(shutdown_enter);
++DEFINE_SMB3_SHUTDOWN_EVENT(shutdown_done);
+ 
++DECLARE_EVENT_CLASS(smb3_shutdown_err_class,
++	TP_PROTO(int rc,
++		__u32 flags,
++		__u32 tid),
++	TP_ARGS(rc, flags, tid),
++	TP_STRUCT__entry(
++		__field(int, rc)
++		__field(__u32, flags)
++		__field(__u32, tid)
++	),
++	TP_fast_assign(
++		__entry->rc = rc;
++		__entry->flags = flags;
++		__entry->tid = tid;
++	),
++	TP_printk("rc=%d flags=0x%x tid=0x%x",
++		__entry->rc, __entry->flags, __entry->tid)
++)
+ 
++#define DEFINE_SMB3_SHUTDOWN_ERR_EVENT(name)        \
++DEFINE_EVENT(smb3_shutdown_err_class, smb3_##name,  \
++	TP_PROTO(int rc,		     \
++		__u32 flags,		     \
++		__u32 tid),		     \
++	TP_ARGS(rc, flags, tid))
+ 
++DEFINE_SMB3_SHUTDOWN_ERR_EVENT(shutdown_err);
+ 
+ DECLARE_EVENT_CLASS(smb3_credit_class,
+ 	TP_PROTO(__u64	currmid,
+-- 
+2.43.0
+

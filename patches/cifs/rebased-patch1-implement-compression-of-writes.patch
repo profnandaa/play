@@ -1,0 +1,421 @@
+diff --git a/fs/smb/client/Kconfig b/fs/smb/client/Kconfig
+index 2517dc242386..2aff6d1395ce 100644
+--- a/fs/smb/client/Kconfig
++++ b/fs/smb/client/Kconfig
+@@ -204,4 +204,18 @@ config CIFS_ROOT
+ 
+ 	  Most people say N here.
+ 
++config CIFS_COMPRESSION
++	bool "SMB message compression (Experimental)"
++	depends on CIFS
++	default n
++	help
++	  Enables over-the-wire message compression for SMB 3.1.1
++	  mounts when negotiated with the server.
++
++	  Only write requests with data size >= PAGE_SIZE will be
++	  compressed to avoid wasting resources.
++
++	  Say Y here if you want SMB traffic to be compressed.
++	  If unsure, say N.
++
+ endif
+diff --git a/fs/smb/client/Makefile b/fs/smb/client/Makefile
+index e11985f2460b..22023e30915b 100644
+--- a/fs/smb/client/Makefile
++++ b/fs/smb/client/Makefile
+@@ -33,3 +33,5 @@ cifs-$(CONFIG_CIFS_SMB_DIRECT) += smbdirect.o
+ cifs-$(CONFIG_CIFS_ROOT) += cifsroot.o
+ 
+ cifs-$(CONFIG_CIFS_ALLOW_INSECURE_LEGACY) += smb1ops.o cifssmb.o
++
++cifs-$(CONFIG_CIFS_COMPRESSION) += compress.o compress/lz77.o
+diff --git a/fs/smb/client/cifs_debug.c b/fs/smb/client/cifs_debug.c
+index c71ae5c04306..c3cfa8f7a337 100644
+--- a/fs/smb/client/cifs_debug.c
++++ b/fs/smb/client/cifs_debug.c
+@@ -349,6 +349,9 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 	seq_printf(m, ",ACL");
+ #ifdef CONFIG_CIFS_SWN_UPCALL
+ 	seq_puts(m, ",WITNESS");
++#endif
++#ifdef CONFIG_CIFS_COMPRESSION
++	seq_puts(m, ",COMPRESSION");
+ #endif
+ 	seq_putc(m, '\n');
+ 	seq_printf(m, "CIFSMaxBufSize: %d\n", CIFSMaxBufSize);
+@@ -475,7 +478,9 @@ static int cifs_debug_data_proc_show(struct seq_file *m, void *v)
+ 		}
+ 
+ 		seq_puts(m, "\nCompression: ");
+-		if (!server->compression.requested)
++		if (!IS_ENABLED(CONFIG_CIFS_COMPRESSION))
++			seq_puts(m, "no built-in support");
++		else if (!server->compression.requested)
+ 			seq_puts(m, "disabled on mount");
+ 		else if (server->compression.enabled)
+ 			seq_printf(m, "enabled (%s)", compression_alg_str(server->compression.alg));
+diff --git a/fs/smb/client/cifsfs.c b/fs/smb/client/cifsfs.c
+index 2c4b357d85e2..f7f916667019 100644
+--- a/fs/smb/client/cifsfs.c
++++ b/fs/smb/client/cifsfs.c
+@@ -157,6 +157,7 @@ struct workqueue_struct	*fileinfo_put_wq;
+ struct workqueue_struct	*cifsoplockd_wq;
+ struct workqueue_struct	*deferredclose_wq;
+ struct workqueue_struct	*serverclose_wq;
++struct workqueue_struct *compress_wq;
+ __u32 cifs_lock_secret;
+ 
+ /*
+@@ -1897,9 +1898,15 @@ init_cifs(void)
+ 		goto out_destroy_deferredclose_wq;
+ 	}
+ 
++	compress_wq = alloc_workqueue("smb3compressd", WQ_CPU_INTENSIVE|WQ_FREEZABLE|WQ_MEM_RECLAIM, 0);
++	if (!compress_wq) {
++		rc = -ENOMEM;
++		goto out_destroy_serverclose_wq;
++	}
++
+ 	rc = cifs_init_inodecache();
+ 	if (rc)
+-		goto out_destroy_serverclose_wq;
++		goto out_destroy_compress_wq;
+ 
+ 	rc = cifs_init_netfs();
+ 	if (rc)
+@@ -1967,6 +1974,8 @@ init_cifs(void)
+ 	cifs_destroy_netfs();
+ out_destroy_inodecache:
+ 	cifs_destroy_inodecache();
++out_destroy_compress_wq:
++	destroy_workqueue(compress_wq);
+ out_destroy_serverclose_wq:
+ 	destroy_workqueue(serverclose_wq);
+ out_destroy_deferredclose_wq:
+@@ -2005,6 +2014,7 @@ exit_cifs(void)
+ 	destroy_mids();
+ 	cifs_destroy_netfs();
+ 	cifs_destroy_inodecache();
++	destroy_workqueue(compress_wq);
+ 	destroy_workqueue(deferredclose_wq);
+ 	destroy_workqueue(cifsoplockd_wq);
+ 	destroy_workqueue(decrypt_wq);
+diff --git a/fs/smb/client/cifsglob.h b/fs/smb/client/cifsglob.h
+index 8e86fec7dcd2..aa5ee074723c 100644
+--- a/fs/smb/client/cifsglob.h
++++ b/fs/smb/client/cifsglob.h
+@@ -556,7 +556,7 @@ struct smb_version_operations {
+ 	bool (*dir_needs_close)(struct cifsFileInfo *);
+ 	long (*fallocate)(struct file *, struct cifs_tcon *, int, loff_t,
+ 			  loff_t);
+-	/* init transform request - used for encryption for now */
++	/* init transform (compress/encrypt) request */
+ 	int (*init_transform_rq)(struct TCP_Server_Info *, int num_rqst,
+ 				 struct smb_rqst *, struct smb_rqst *);
+ 	int (*is_transform_hdr)(void *buf);
+@@ -1899,6 +1899,7 @@ static inline bool is_replayable_error(int error)
+ #define   CIFS_HAS_CREDITS        0x0400 /* already has credits */
+ #define   CIFS_TRANSFORM_REQ      0x0800 /* transform request before sending */
+ #define   CIFS_NO_SRV_RSP         0x1000 /* there is no server response */
++#define   CIFS_COMPRESS_REQ       0x4000 /* compress request before sending */
+ 
+ /* Security Flags: indicate type of session setup needed */
+ #define   CIFSSEC_MAY_SIGN	0x00001
+@@ -2094,6 +2095,7 @@ extern struct workqueue_struct *fileinfo_put_wq;
+ extern struct workqueue_struct *cifsoplockd_wq;
+ extern struct workqueue_struct *deferredclose_wq;
+ extern struct workqueue_struct *serverclose_wq;
++extern struct workqueue_struct *compress_wq;
+ extern __u32 cifs_lock_secret;
+ 
+ extern mempool_t *cifs_sm_req_poolp;
+diff --git a/fs/smb/client/fs_context.c b/fs/smb/client/fs_context.c
+index bc926ab2555b..20dc31a07a56 100644
+--- a/fs/smb/client/fs_context.c
++++ b/fs/smb/client/fs_context.c
+@@ -978,9 +978,12 @@ static int smb3_fs_context_parse_param(struct fs_context *fc,
+ 
+ 	switch (opt) {
+ 	case Opt_compress:
++		if (!IS_ENABLED(CONFIG_CIFS_COMPRESSION)) {
++			cifs_errorf(fc, "CONFIG_CIFS_COMPRESSION kernel config option is unset\n");
++			goto cifs_parse_mount_err;
++		}
+ 		ctx->compress = true;
+-		cifs_dbg(VFS,
+-			"SMB3 compression support is experimental\n");
++		cifs_dbg(VFS, "SMB3 compression support is experimental\n");
+ 		break;
+ 	case Opt_nodfs:
+ 		ctx->nodfs = 1;
+diff --git a/fs/smb/client/smb2ops.c b/fs/smb/client/smb2ops.c
+index 322cabc69c6f..a152ea623a19 100644
+--- a/fs/smb/client/smb2ops.c
++++ b/fs/smb/client/smb2ops.c
+@@ -29,6 +29,7 @@
+ #include "fs_context.h"
+ #include "cached_dir.h"
+ #include "reparse.h"
++#include "compress.h"
+ 
+ /* Change credits for different ops and return the total number of credits */
+ static int
+@@ -4132,12 +4133,34 @@ smb2_dir_needs_close(struct cifsFileInfo *cfile)
+ 	return !cfile->invalidHandle;
+ }
+ 
++static __always_inline bool has_compress_hdr(void *buf)
++{
++	struct smb2_compression_hdr *hdr = buf;
++
++	if (hdr->ProtocolId == SMB2_COMPRESSION_TRANSFORM_ID)
++		return true;
++
++	return false;
++}
++
++static __always_inline struct smb2_hdr *get_shdr(void *buf)
++{
++	struct smb2_hdr *shdr = buf;
++
++	if (shdr->ProtocolId == SMB2_PROTO_NUMBER)
++		return buf;
++
++	if (has_compress_hdr(buf))
++		return buf + SMB_COMPRESS_HDR_LEN;
++
++	BUG();
++}
++
+ static void
+ fill_transform_hdr(struct smb2_transform_hdr *tr_hdr, unsigned int orig_len,
+ 		   struct smb_rqst *old_rq, __le16 cipher_type)
+ {
+-	struct smb2_hdr *shdr =
+-			(struct smb2_hdr *)old_rq->rq_iov[0].iov_base;
++	struct smb2_hdr *shdr = get_shdr(old_rq->rq_iov[0].iov_base);
+ 
+ 	memset(tr_hdr, 0, sizeof(struct smb2_transform_hdr));
+ 	tr_hdr->ProtocolId = SMB2_TRANSFORM_PROTO_NUM;
+@@ -4455,13 +4478,10 @@ smb3_init_transform_rq(struct TCP_Server_Info *server, int num_rqst,
+ 
+ 	rc = crypt_message(server, num_rqst, new_rq, 1);
+ 	cifs_dbg(FYI, "Encrypt message returned %d\n", rc);
++err_free:
+ 	if (rc)
+-		goto err_free;
+-
+-	return rc;
++		smb3_free_compound_rqst(num_rqst - 1, &new_rq[1]);
+ 
+-err_free:
+-	smb3_free_compound_rqst(num_rqst - 1, &new_rq[1]);
+ 	return rc;
+ }
+ 
+diff --git a/fs/smb/client/smb2pdu.c b/fs/smb/client/smb2pdu.c
+index 9a06b5594669..faf903d7ff31 100644
+--- a/fs/smb/client/smb2pdu.c
++++ b/fs/smb/client/smb2pdu.c
+@@ -42,6 +42,7 @@
+ #include "dfs_cache.h"
+ #endif
+ #include "cached_dir.h"
++#include "compress.h"
+ 
+ /*
+  *  The following table defines the expected "StructureSize" of SMB2 requests
+@@ -602,10 +603,12 @@ build_compression_ctxt(struct smb2_compression_capabilities_context *pneg_ctxt)
+ 	pneg_ctxt->DataLength =
+ 		cpu_to_le16(sizeof(struct smb2_compression_capabilities_context)
+ 			  - sizeof(struct smb2_neg_context));
+-	pneg_ctxt->CompressionAlgorithmCount = cpu_to_le16(3);
++	pneg_ctxt->CompressionAlgorithmCount = cpu_to_le16(1);
++	/*
++	 * Send the only algorithm we support (XXX: add others as they're
++	 * implemented).
++	 */
+ 	pneg_ctxt->CompressionAlgorithms[0] = SMB3_COMPRESS_LZ77;
+-	pneg_ctxt->CompressionAlgorithms[1] = SMB3_COMPRESS_LZ77_HUFF;
+-	pneg_ctxt->CompressionAlgorithms[2] = SMB3_COMPRESS_LZNT1;
+ }
+ 
+ static unsigned int
+@@ -813,9 +816,7 @@ static void decode_compress_ctx(struct TCP_Server_Info *server,
+ 	}
+ 
+ 	alg = ctxt->CompressionAlgorithms[0];
+-
+-	/* 'NONE' (0) compressor type is never negotiated */
+-	if (alg == 0 || le16_to_cpu(alg) > 3) {
++	if (!smb_compress_alg_valid(alg, false)) {
+ 		pr_warn_once("invalid compression algorithm '%u'\n", alg);
+ 		return;
+ 	}
+@@ -5008,6 +5009,9 @@ smb2_async_writev(struct cifs_io_subrequest *wdata)
+ 		flags |= CIFS_HAS_CREDITS;
+ 	}
+ 
++	if (should_compress(tcon, req))
++		flags |= CIFS_COMPRESS_REQ;
++
+ 	rc = cifs_call_async(server, &rqst, NULL, smb2_writev_callback, NULL,
+ 			     wdata, flags, &wdata->credits);
+ 	/* Can't touch wdata if rc == 0 */
+diff --git a/fs/smb/client/transport.c b/fs/smb/client/transport.c
+index adfe0d058701..5728b52b2f5a 100644
+--- a/fs/smb/client/transport.c
++++ b/fs/smb/client/transport.c
+@@ -28,6 +28,7 @@
+ #include "cifs_debug.h"
+ #include "smb2proto.h"
+ #include "smbdirect.h"
++#include "compress.h"
+ 
+ /* Max number of iovectors we can use off the stack when sending requests. */
+ #define CIFS_MAX_IOV_SIZE 8
+@@ -417,6 +418,132 @@ __smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
+ 	return rc;
+ }
+ 
++static int __compress_next_cpu = -1;
++
++static int compress_next_cpu(void)
++{
++	int cpu;
++
++	/*
++	 * Find the next online CPU (will wrap), globally accounted by
++	 * %__compress_next_cpu, so async decompression works spread
++	 * evenly across the system.
++	 */
++	cpu = cpumask_next_wrap(__compress_next_cpu, cpu_online_mask, -1, true);
++	if (unlikely(cpu >= nr_cpu_ids)) {
++		cpu = cpumask_next(raw_smp_processor_id(), cpu_online_mask);
++		if (unlikely(cpu >= nr_cpu_ids))
++			/* last resort */
++			cpu = raw_smp_processor_id();
++	}
++
++	__compress_next_cpu = cpu;
++	return cpu;
++}
++
++static void compress_thread(struct work_struct *work)
++{
++	struct smb_compress_ctx *ctx = container_of(work, struct smb_compress_ctx, work);
++	struct TCP_Server_Info *server = ctx->server;
++	struct cifs_writedata *wdata = ctx->mid->callback_data;
++	struct smb_rqst rq = { 0 };
++	struct kvec iov[2] = { 0 };
++	size_t len = ctx->len;
++	int ret;
++
++	ret = smb_compress(ctx->buf, ctx->data, &len);
++	if (!ret) {
++		iov[0].iov_base = ctx->buf;
++		iov[0].iov_len = len;
++		rq.rq_iov = &iov[0];
++		rq.rq_nvec = 1;
++	} else {
++		if (ret != -ENODATA && ret != -EMSGSIZE)
++			goto out;
++
++		/* non-fatal error, send original (uncompressed) request instead */
++		iov[0].iov_base = ctx->buf + SMB_COMPRESS_HDR_LEN;
++		iov[0].iov_len = sizeof(struct smb2_write_req);
++		iov[1].iov_base = ctx->data;
++		iov[1].iov_len = ctx->len;
++		rq.rq_iov = &iov[0];
++		rq.rq_nvec = 2;
++	}
++
++	ret = __smb_send_rqst(server, 1, &rq);
++out:
++	wdata->result = ret;
++	kref_put(&wdata->refcount, cifs_writedata_release);
++	release_mid(ctx->mid);
++
++	kvfree(ctx->buf);
++	kvfree(ctx->data);
++	kfree(ctx);
++}
++
++static int compress_async(struct TCP_Server_Info *server, struct smb_rqst *rqst)
++{
++	struct smb_compress_ctx *ctx;
++	struct iov_iter tmp = rqst->rq_iter;
++	int ret = -ENOMEM;
++
++	if (WARN(rqst->rq_iov->iov_len != sizeof(struct smb2_write_req),
++		 "%s: unexpected buf len %zu\n", __func__, rqst->rq_iov->iov_len))
++		return -EIO;
++
++	if (iov_iter_count(&rqst->rq_iter) < SMB_COMPRESS_MIN_LEN)
++		return -ENODATA;
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		goto err_free;
++
++	ctx->mid = server->ops->find_mid(server, rqst->rq_iov->iov_base);
++	if (!ctx->mid) {
++		/* XXX: better error handling here */
++		pr_warn("%s: can't find mid to compress\n", __func__);
++		ret = -EIO;
++		goto err_free;
++	}
++
++	if (!ctx->mid->callback_data) {
++		/* XXX: better error handling here */
++		pr_warn("%s: can't find write data to compress\n", __func__);
++		ret = -EIO;
++		goto err_free;
++	}
++
++	ctx->len = iov_iter_count(&rqst->rq_iter);
++	ctx->buf = kvzalloc(SMB_COMPRESS_HDR_LEN + rqst->rq_iov->iov_len + ctx->len, GFP_KERNEL);
++	if (!ctx->buf)
++		goto err_free;
++
++	ctx->data = kvzalloc(ctx->len, GFP_KERNEL);
++	if (!ctx->data)
++		goto err_free;
++
++	memcpy(ctx->buf + SMB_COMPRESS_HDR_LEN, rqst->rq_iov->iov_base, rqst->rq_iov->iov_len);
++	if (!copy_from_iter_full(ctx->data, ctx->len, &tmp)) {
++		ret = -EIO;
++		goto err_free;
++	}
++
++	ctx->server = server;
++	INIT_WORK(&ctx->work, compress_thread);
++
++	kref_get(&((struct cifs_writedata *)ctx->mid->callback_data)->refcount);
++	queue_work_on(compress_next_cpu(), compress_wq, &ctx->work);
++	ret = 0;
++err_free:
++	if (ret) {
++		kvfree(ctx->data);
++		kvfree(ctx->buf);
++		kfree(ctx);
++	}
++
++	return ret;
++}
++
+ struct send_req_vars {
+ 	struct smb2_transform_hdr tr_hdr;
+ 	struct smb_rqst rqst[MAX_COMPOUND];
+@@ -432,6 +559,9 @@ smb_send_rqst(struct TCP_Server_Info *server, int num_rqst,
+ 	struct kvec *iov;
+ 	int rc;
+ 
++	if (flags & CIFS_COMPRESS_REQ)
++		return compress_async(server, rqst);
++
+ 	if (!(flags & CIFS_TRANSFORM_REQ))
+ 		return __smb_send_rqst(server, num_rqst, rqst);
+ 
